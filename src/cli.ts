@@ -12,6 +12,8 @@
 
 import { parseArgs } from "node:util";
 import { randomUUID } from "node:crypto";
+import * as readline from "node:readline/promises";
+import { stdin as input, stdout as output } from "node:process";
 import {
   CardiaApi,
   ConfigError,
@@ -252,6 +254,75 @@ async function cmdPermissions(
 }
 
 // ---------------------------------------------------------------------------
+// cardia teams — onboarding interactivo: empresa + tarjeta para un miembro (persona/agente)
+// ---------------------------------------------------------------------------
+async function cmdTeams(api: CardiaApi): Promise<void> {
+  const rl = readline.createInterface({ input, output });
+  const ask = (q: string) => rl.question(q);
+  try {
+    console.log("");
+    console.log(
+      "  " + c.bold(c.cyan("◆ Cardia Teams")) +
+        c.gray(" — pagos para tu equipo (gente + agentes), con control")
+    );
+    console.log(
+      c.gray("  Tarjetas en USDT o pesos, con límite, para pagar IA (Claude, OpenAI, APIs...).\n")
+    );
+
+    // 1/3 — Empresa
+    console.log(c.bold("  1/3  Tu empresa"));
+    const empresa = (await ask("       Nombre › ")).trim();
+    if (!empresa) throw new UsageError("Necesito el nombre de la empresa.");
+    const customer = await api.createCustomer({ name: empresa });
+    console.log(`       ${OK} Empresa creada: ${c.bold(empresa)}\n`);
+
+    // 2/3 — A quién
+    console.log(c.bold("  2/3  ¿A quién le das una tarjeta?"));
+    const tipo = (await ask("       Agente (a) o Persona (p) › ")).trim().toLowerCase();
+    const esAgente = tipo.startsWith("a");
+    const quien = esAgente ? "agente" : "persona";
+    const nombre = (await ask(`       Nombre del ${quien} › `)).trim() || quien;
+    const moneda = (await ask("       Moneda — USDT (u) o Pesos (p) › ")).trim().toLowerCase();
+    const currency = moneda.startsWith("p") ? "ARS" : "USD"; // USDT se respalda en saldo USD
+    const monedaLabel = currency === "ARS" ? "Pesos (ARS)" : "USDT";
+    console.log("");
+
+    // 3/3 — Límite
+    console.log(c.bold("  3/3  Límite mensual"));
+    const limStr = (await ask(`       ${currency === "ARS" ? "$" : "US$"} › `)).trim();
+    const limitCents = pesosToCents(limStr, "límite"); // *100, sirve para ARS y USD
+
+    const { cards } = await api.createMember({
+      label: nombre,
+      customerId: customer.id,
+      limit: limitCents,
+      mode: "free", // tarjeta de gasto: paga hasta el límite (el control fino/scope es para agentes)
+    });
+    const card = cards.find((cc) => (cc.currency ?? "ARS") === currency) ?? cards[0];
+    console.log(
+      `       ${OK} Tarjeta ${c.bold(monedaLabel)} creada para ${c.bold(nombre)} ${c.gray("(" + quien + ")")}\n`
+    );
+
+    // Resultado
+    console.log("  " + c.green(c.bold("✓ Listo.")));
+    if (esAgente) {
+      console.log("  Conectá el agente (Claude / Cursor) por MCP:");
+      console.log("     " + c.cyan(`npx cardia mcp --card ${card?.id ?? ""}`));
+    } else {
+      console.log(
+        `  Pasale a ${c.bold(nombre)} los datos de la tarjeta ${c.gray("••••" + (card?.last4 ?? "----"))} ` +
+          "para cargar en Claude / OpenAI."
+      );
+    }
+    const limTxt = currency === "ARS" ? centsToPesos(limitCents) : `US$${limitCents / 100}`;
+    console.log(c.gray(`\n  Límite: ${limTxt} / mes. Vos controlás y ves cada cobro.`));
+    console.log(c.gray("  Panel del gasto de IA del equipo → cardia.digital/admin\n"));
+  } finally {
+    rl.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Ayuda
 // ---------------------------------------------------------------------------
 function printHelp(): void {
@@ -262,6 +333,7 @@ function printHelp(): void {
     "  cardia <comando> [opciones]",
     "",
     c.bold("Comandos:"),
+    `  ${c.cyan("teams")}                            Onboarding: creá tu empresa y dale una tarjeta a un miembro (persona/agente).`,
     `  ${c.cyan("cards")}                            Lista tarjetas (id, label, ••••last4, estado).`,
     `  ${c.cyan("grant")}   --card <id> --merchant <Jumbo> --max <pesos> [--ttl 1h]`,
     `                                   Crea un permiso (comercio, tope, vigencia).`,
@@ -281,6 +353,20 @@ function printHelp(): void {
     "  cardia permissions --card card_123",
   ];
   console.log(lines.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// Beta: sin credenciales (no hay registro público todavía) → mensaje + waitlist.
+// ---------------------------------------------------------------------------
+function printBeta(): void {
+  console.log("");
+  console.log("  " + c.bold(c.cyan("◆ Cardia")) + c.gray(" — la tarjeta para tus agentes de IA"));
+  console.log("");
+  console.log("  🔒 Estamos en " + c.bold("beta privada") + ". Todavía no abrimos el registro público.");
+  console.log("");
+  console.log("  Sumate a la lista de espera y te avisamos apenas abramos:");
+  console.log("     " + c.bold(c.cyan("https://cardia.digital")));
+  console.log("");
 }
 
 // ---------------------------------------------------------------------------
@@ -324,10 +410,19 @@ async function main(): Promise<void> {
     }
   }
 
+  // Sin credenciales configuradas → beta privada (no hay registro público todavía).
+  if (!process.env.CARDIA_API_TOKEN || !process.env.CARDIA_API_URL) {
+    printBeta();
+    return;
+  }
+
   // Los comandos necesitan API -> validar env recién acá (cards/grant/buy/permissions).
   const api = CardiaApi.fromEnv();
 
   switch (command) {
+    case "teams":
+      await cmdTeams(api);
+      break;
     case "cards":
       await cmdCards(api);
       break;
@@ -342,7 +437,7 @@ async function main(): Promise<void> {
       break;
     default:
       throw new UsageError(
-        `Comando desconocido: "${command}". Probá: cards, grant, buy, permissions. (cardia help)`
+        `Comando desconocido: "${command}". Probá: teams, cards, grant, buy, permissions. (cardia help)`
       );
   }
 }

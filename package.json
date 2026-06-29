@@ -1,5 +1,5 @@
 {
-  "name": "cardia-cli",
+  "name": "cardia",
   "version": "0.1.0",
   "description": "CLI para que un agente IA opere tarjetas Cardia con control via permisos acotados",
   "type": "module",
