@@ -6,6 +6,8 @@
  *   CARDIA_API_TOKEN  -> se envía como header `x-admin-token`
  */
 
+export type Currency = "ARS" | "USD";
+
 export interface Card {
   id: string;
   label: string;
@@ -14,6 +16,17 @@ export interface Card {
   spent: number;
   status: string;
   accountId: string;
+  currency?: Currency;
+}
+
+/** Cliente/empresa titular (capa de organización sobre las cuentas). */
+export interface Customer {
+  id: string;
+  name: string;
+  email?: string;
+  document?: string;
+  phone?: string;
+  createdAt?: string;
 }
 
 export interface Permission {
@@ -196,6 +209,39 @@ export class CardiaApi {
     return this.request<AuthorizationResult>(
       "POST",
       "/admin/authorizations/simulate",
+      input
+    );
+  }
+
+  /** POST /admin/customers — crea una empresa/cliente. */
+  async createCustomer(input: {
+    name: string;
+    email?: string;
+    document?: string;
+    phone?: string;
+  }): Promise<Customer> {
+    const data = await this.request<{ customer: Customer }>(
+      "POST",
+      "/admin/customers",
+      input
+    );
+    return data.customer;
+  }
+
+  /**
+   * POST /admin/cards SIN accountId — crea una cuenta nueva + sus tarjetas (ARS + USD)
+   * para un miembro (persona/agente). Devuelve la cuenta y las tarjetas emitidas.
+   */
+  async createMember(input: {
+    label: string;
+    customerId?: string;
+    limit: number;
+    mode?: "free" | "scoped";
+    currency?: Currency;
+  }): Promise<{ accountId: string; cards: Card[] }> {
+    return this.request<{ accountId: string; cards: Card[] }>(
+      "POST",
+      "/admin/cards",
       input
     );
   }
