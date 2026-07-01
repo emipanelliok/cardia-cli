@@ -8,10 +8,12 @@
  *   cardia grant       --card <id> --merchant <Jumbo> --max <pesos> [--ttl 1h]
  *   cardia buy         --card <id> --merchant <Jumbo> --amount <pesos> [--max <pesos>] [--ttl 1h]
  *   cardia permissions [--card <id>]
+ *   cardia mcp         (servidor MCP por stdio para Claude Code / Claude Desktop / Cursor)
  */
 
 import { parseArgs } from "node:util";
 import { randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
 import * as readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import {
@@ -44,6 +46,10 @@ const FAIL = c.red("✗"); // ✗
 // Errores de uso (args inválidos) -> mensaje + exit 2
 // ---------------------------------------------------------------------------
 class UsageError extends Error {}
+
+// Nombre y versión reales desde package.json (nada hardcodeado).
+const require = createRequire(import.meta.url);
+const pkg = require("../package.json") as { name: string; version: string };
 
 // ---------------------------------------------------------------------------
 // Helpers de parseo / formato
@@ -237,10 +243,7 @@ async function cmdPermissions(
   api: CardiaApi,
   opts: { card?: string }
 ): Promise<void> {
-  let permissions = await api.listPermissions();
-  if (opts.card) {
-    permissions = permissions.filter((p) => p.cardId === opts.card);
-  }
+  const permissions = await api.listPermissions(opts.card);
   if (permissions.length === 0) {
     console.log(
       c.gray(opts.card ? `No hay permisos para la tarjeta ${opts.card}.` : "No hay permisos.")
@@ -292,11 +295,13 @@ async function cmdTeams(api: CardiaApi): Promise<void> {
     const limStr = (await ask(`       ${currency === "ARS" ? "$" : "US$"} › `)).trim();
     const limitCents = pesosToCents(limStr, "límite"); // *100, sirve para ARS y USD
 
+    // AGENTES → "scoped" (deny-by-default: solo compra con permisos otorgados via `cardia grant`).
+    // PERSONAS → "free" (tarjeta de gasto: paga hasta el límite sin permisos).
     const { cards } = await api.createMember({
       label: nombre,
       customerId: customer.id,
       limit: limitCents,
-      mode: "free", // tarjeta de gasto: paga hasta el límite (el control fino/scope es para agentes)
+      mode: esAgente ? "scoped" : "free",
     });
     const card = cards.find((cc) => (cc.currency ?? "ARS") === currency) ?? cards[0];
     console.log(
@@ -307,7 +312,14 @@ async function cmdTeams(api: CardiaApi): Promise<void> {
     console.log("  " + c.green(c.bold("✓ Listo.")));
     if (esAgente) {
       console.log("  Conectá el agente (Claude / Cursor) por MCP:");
-      console.log("     " + c.cyan(`npx cardia mcp --card ${card?.id ?? ""}`));
+      console.log("     " + c.cyan("claude mcp add cardia -- npx cardia mcp"));
+      console.log(
+        c.gray(
+          "  La tarjeta arranca en modo scoped: SIN permisos, no puede gastar nada.\n" +
+            "  Habilitá compras con: " +
+            `cardia grant --card ${card?.id ?? "<id>"} --merchant <Comercio> --max <pesos> --ttl 1h`
+        )
+      );
     } else {
       console.log(
         `  Pasale a ${c.bold(nombre)} los datos de la tarjeta ${c.gray("••••" + (card?.last4 ?? "----"))} ` +
@@ -340,6 +352,7 @@ function printHelp(): void {
     `  ${c.cyan("buy")}     --card <id> --merchant <Jumbo> --amount <pesos> [--max <pesos>] [--ttl 1h]`,
     `                                   Compra. Con --max crea el permiso y luego compra.`,
     `  ${c.cyan("permissions")} [--card <id>]         Lista permisos con estado y vigencia.`,
+    `  ${c.cyan("mcp")}                              Servidor MCP por stdio (Claude Code, Claude Desktop, Cursor).`,
     "",
     c.bold("Variables de entorno:"),
     "  CARDIA_API_URL     base de la API admin (ej. https://cardia-api.emipanelli.com)",
@@ -351,6 +364,7 @@ function printHelp(): void {
     "  cardia buy --card card_123 --merchant Jumbo --amount 12000 --max 50000",
     "  cardia buy --card card_123 --merchant Jumbo --amount 12000",
     "  cardia permissions --card card_123",
+    "  claude mcp add cardia -- npx cardia mcp   " + c.gray("# conectá tu agente por MCP"),
   ];
   console.log(lines.join("\n"));
 }
@@ -372,6 +386,8 @@ function printBeta(): void {
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
+const KNOWN_COMMANDS = ["teams", "cards", "grant", "buy", "permissions", "mcp"];
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const command = argv[0];
@@ -382,8 +398,16 @@ async function main(): Promise<void> {
   }
 
   if (command === "version" || command === "--version" || command === "-v") {
-    console.log("cardia-cli 0.1.0");
+    console.log(`${pkg.name} ${pkg.version}`);
     return;
+  }
+
+  // Validar el comando ANTES del gate de beta: un comando desconocido es SIEMPRE
+  // error de uso (exit 2), tenga o no credenciales configuradas.
+  if (!KNOWN_COMMANDS.includes(command)) {
+    throw new UsageError(
+      `Comando desconocido: "${command}". Probá: ${KNOWN_COMMANDS.join(", ")}. (cardia help)`
+    );
   }
 
   // Parseo de flags compartido por los comandos que las usan.
@@ -410,13 +434,33 @@ async function main(): Promise<void> {
     }
   }
 
+  const hasEnv = Boolean(
+    process.env.CARDIA_API_TOKEN && process.env.CARDIA_API_URL
+  );
+
+  // `cardia mcp`: stdout es EXCLUSIVO del protocolo JSON-RPC. Sin credenciales,
+  // el error va a stderr y salimos con 1 (jamás el banner beta por stdout,
+  // rompería el handshake con Claude/Cursor).
+  if (command === "mcp") {
+    if (!hasEnv) {
+      process.stderr.write(
+        "cardia mcp: faltan variables de entorno CARDIA_API_URL y/o CARDIA_API_TOKEN.\n" +
+          "Configuralas en el bloque \"env\" del cliente MCP (Claude Code / Claude Desktop / Cursor)\n" +
+          "o exportalas en el shell. Beta privada: pedí acceso en https://cardia.digital\n"
+      );
+      process.exit(1);
+    }
+    const { runMcpServer } = await import("./mcp.js");
+    await runMcpServer();
+    return;
+  }
+
   // Sin credenciales configuradas → beta privada (no hay registro público todavía).
-  if (!process.env.CARDIA_API_TOKEN || !process.env.CARDIA_API_URL) {
+  if (!hasEnv) {
     printBeta();
     return;
   }
 
-  // Los comandos necesitan API -> validar env recién acá (cards/grant/buy/permissions).
   const api = CardiaApi.fromEnv();
 
   switch (command) {
@@ -435,10 +479,6 @@ async function main(): Promise<void> {
     case "permissions":
       await cmdPermissions(api, values);
       break;
-    default:
-      throw new UsageError(
-        `Comando desconocido: "${command}". Probá: teams, cards, grant, buy, permissions. (cardia help)`
-      );
   }
 }
 

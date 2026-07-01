@@ -42,8 +42,44 @@ export interface Permission {
 
 export interface AuthorizationResult {
   status: "APPROVED" | "REJECTED";
+  approved?: boolean;
   reason?: string;
+  detail?: string;
   permissionId?: string;
+  cardId?: string;
+}
+
+/** Cuenta (miembro del equipo) con sus saldos multi-moneda en centavos. */
+export interface AccountSummary {
+  id: string;
+  userId?: string;
+  currency?: Currency;
+  balanceCents?: number; // legacy: espejo de balances.ARS
+  balances?: { ARS: number; USD: number }; // centavos por moneda
+  status?: string;
+  createdAt?: string;
+  cardCount?: number;
+  customerId?: string | null;
+  customerName?: string | null;
+}
+
+/** Autorización (transacción) registrada. `amount` en centavos. */
+export interface AuthorizationSummary {
+  id: string;
+  cardId: string;
+  amount: number;
+  merchant: string;
+  status: "APPROVED" | "REJECTED";
+  reason?: string;
+  detail?: string;
+  at: string;
+}
+
+export interface Pagination {
+  page: number;
+  limit: number;
+  total: number;
+  pages: number;
 }
 
 /** Error de configuración (env vars faltantes). */
@@ -108,13 +144,34 @@ export class CardiaApi {
     return new CardiaApi(loadConfig(env));
   }
 
+  /** Timeout de cada request HTTP (fetch no tiene timeout por defecto). */
+  private static readonly REQUEST_TIMEOUT_MS = 15_000;
+
   private async request<T>(
     method: string,
     path: string,
-    body?: unknown
+    body?: unknown,
+    query?: Record<string, string | number | boolean | undefined>
   ): Promise<T> {
-    const url = `${this.baseUrl}${path}`;
+    let url = `${this.baseUrl}${path}`;
+    if (query) {
+      const qs = new URLSearchParams();
+      for (const [k, v] of Object.entries(query)) {
+        if (v !== undefined) qs.set(k, String(v));
+      }
+      const s = qs.toString();
+      if (s) url += `?${s}`;
+    }
+
+    // Timeout defensivo: aborta la request si la API no responde en 15s.
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(),
+      CardiaApi.REQUEST_TIMEOUT_MS
+    );
+
     let res: Response;
+    let text: string;
     try {
       res = await fetch(url, {
         method,
@@ -124,16 +181,26 @@ export class CardiaApi {
           accept: "application/json",
         },
         body: body !== undefined ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
       });
+      text = await res.text();
     } catch (err) {
+      if (controller.signal.aborted) {
+        throw new ApiError(
+          `La API en ${this.baseUrl} no respondió dentro de los ${
+            CardiaApi.REQUEST_TIMEOUT_MS / 1000
+          }s (timeout en ${method} ${path}). ` +
+            `Verificá que el servicio esté arriba y que CARDIA_API_URL sea correcto.`
+        );
+      }
       const detail = err instanceof Error ? err.message : String(err);
       throw new ApiError(
         `No se pudo conectar con la API en ${this.baseUrl} (${detail}). ` +
           `Verificá que CARDIA_API_URL sea correcto y que el servicio esté arriba.`
       );
+    } finally {
+      clearTimeout(timer);
     }
-
-    const text = await res.text();
 
     if (!res.ok) {
       let reason = text;
@@ -190,11 +257,13 @@ export class CardiaApi {
     return data.permission;
   }
 
-  /** GET /admin/permissions */
-  async listPermissions(): Promise<Permission[]> {
+  /** GET /admin/permissions — con filtro opcional por tarjeta (server-side). */
+  async listPermissions(cardId?: string): Promise<Permission[]> {
     const data = await this.request<{ permissions: Permission[] }>(
       "GET",
-      "/admin/permissions"
+      "/admin/permissions",
+      undefined,
+      { cardId }
     );
     return data.permissions ?? [];
   }
@@ -225,7 +294,8 @@ export class CardiaApi {
       "/admin/customers",
       input
     );
-    return data.customer;
+    // Fallback defensivo: si la API devuelve el customer "plano" (sin envolver), lo usamos igual.
+    return data.customer ?? (data as unknown as Customer);
   }
 
   /**
@@ -239,10 +309,89 @@ export class CardiaApi {
     mode?: "free" | "scoped";
     currency?: Currency;
   }): Promise<{ accountId: string; cards: Card[] }> {
-    return this.request<{ accountId: string; cards: Card[] }>(
+    const data = await this.request<{ accountId: string; cards: Card[] }>(
       "POST",
       "/admin/cards",
       input
     );
+    // Fallback defensivo: nunca devolver cards undefined (evita crash en el wizard).
+    return { accountId: data.accountId, cards: data.cards ?? [] };
+  }
+
+  /** GET /admin/accounts — cuentas con balances por moneda (centavos). */
+  async listAccounts(): Promise<AccountSummary[]> {
+    const data = await this.request<{ accounts: AccountSummary[] }>(
+      "GET",
+      "/admin/accounts"
+    );
+    return data.accounts ?? [];
+  }
+
+  /** GET /admin/accounts/:id — detalle de una cuenta (saldos, tarjetas, movimientos). */
+  async getAccount(accountId: string): Promise<{
+    account: AccountSummary;
+    cards: Card[];
+    movements: AuthorizationSummary[];
+  }> {
+    const data = await this.request<{
+      account: AccountSummary;
+      cards: Card[];
+      movements: AuthorizationSummary[];
+    }>("GET", `/admin/accounts/${encodeURIComponent(accountId)}`);
+    return {
+      account: data.account ?? (data as unknown as AccountSummary),
+      cards: data.cards ?? [],
+      movements: data.movements ?? [],
+    };
+  }
+
+  /** PATCH /admin/cards/:id/limit — cambia el límite (en centavos). */
+  async setCardLimit(cardId: string, limitCents: number): Promise<Card> {
+    const data = await this.request<{ card: Card }>(
+      "PATCH",
+      `/admin/cards/${encodeURIComponent(cardId)}/limit`,
+      { limit: limitCents }
+    );
+    return data.card ?? (data as unknown as Card);
+  }
+
+  /** POST /admin/cards/:id/block — congela la tarjeta. */
+  async blockCard(cardId: string): Promise<Card> {
+    const data = await this.request<{ card: Card }>(
+      "POST",
+      `/admin/cards/${encodeURIComponent(cardId)}/block`
+    );
+    return data.card ?? (data as unknown as Card);
+  }
+
+  /** POST /admin/cards/:id/activate — reactiva la tarjeta. */
+  async activateCard(cardId: string): Promise<Card> {
+    const data = await this.request<{ card: Card }>(
+      "POST",
+      `/admin/cards/${encodeURIComponent(cardId)}/activate`
+    );
+    return data.card ?? (data as unknown as Card);
+  }
+
+  /** GET /admin/authorizations — transacciones paginadas, filtro opcional por tarjeta/estado. */
+  async listAuthorizations(opts?: {
+    cardId?: string;
+    approved?: boolean;
+    page?: number;
+    limit?: number;
+  }): Promise<{ authorizations: AuthorizationSummary[]; pagination?: Pagination }> {
+    const data = await this.request<{
+      authorizations: AuthorizationSummary[];
+      pagination?: Pagination;
+    }>("GET", "/admin/authorizations", undefined, {
+      cardId: opts?.cardId,
+      approved: opts?.approved,
+      page: opts?.page,
+      limit: opts?.limit,
+    });
+    return {
+      authorizations: data.authorizations ?? [],
+      pagination: data.pagination,
+    };
   }
 }

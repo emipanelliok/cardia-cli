@@ -1,15 +1,14 @@
-# cardia-cli
+# cardia
 
-CLI para que un **agente IA opere tarjetas Cardia** desde la línea de comandos.
-
-A diferencia de la competencia (`agent-cards buy` de AgentCard, donde el agente
-tiene barra libre), `cardia` se basa en **permisos acotados**: cada compra está
-limitada por comercio, tope de monto y vigencia (TTL). El agente solo puede
-gastar dentro de lo que vos le habilitaste.
+CLI + servidor MCP para que un **agente IA opere tarjetas Cardia** con control:
+cada compra está limitada por **permisos acotados** (comercio, tope de monto y
+vigencia/TTL). El agente solo puede gastar dentro de lo que vos le habilitaste
+(deny-by-default en tarjetas modo `scoped`).
 
 ```
-agente IA  ──►  cardia grant   (define qué puede comprar y hasta cuánto)
+vos        ──►  cardia grant   (definís qué puede comprar y hasta cuánto)
 agente IA  ──►  cardia buy     (intenta la compra; la API aprueba o rechaza)
+agente IA  ──►  cardia mcp     (o directamente por MCP desde Claude / Cursor)
 ```
 
 ## Instalación
@@ -17,38 +16,53 @@ agente IA  ──►  cardia buy     (intenta la compra; la API aprueba o rechaz
 Requiere Node.js >= 18.
 
 ```bash
-git clone <repo> cardia-cli
-cd cardia-cli
-npm install
-npm run build      # compila TypeScript a dist/
+# global
+npm install -g cardia
+cardia help
 
-# opcional: usarlo como comando global `cardia`
-npm link
+# o sin instalar
+npx cardia help
 ```
 
-Sin `npm link` lo corrés con `node dist/cli.js <comando>`.
+## Beta privada
+
+Cardia está en **beta privada**: todavía no hay registro público. Si corrés
+cualquier comando sin credenciales configuradas, el CLI te muestra el mensaje
+de beta y la lista de espera en **[cardia.digital](https://cardia.digital)**
+(sale con código `0`). La excepción es `cardia mcp`, que sin credenciales
+escribe el error a stderr y sale con código `1` (nunca ensucia stdout, que es
+del protocolo MCP).
 
 ## Configuración (variables de entorno)
 
-La API admin se configura por entorno:
-
-| Variable           | Descripción                                              | Ejemplo                              |
-| ------------------ | -------------------------------------------------------- | ------------------------------------ |
-| `CARDIA_API_URL`   | Base URL de la API admin                                 | `https://cardia-api.emipanelli.com`  |
-| `CARDIA_API_TOKEN` | Token admin; se envía como header `x-admin-token`        | `tok_xxx`                            |
+| Variable           | Descripción                                        | Ejemplo                             |
+| ------------------ | -------------------------------------------------- | ----------------------------------- |
+| `CARDIA_API_URL`   | Base URL de la API admin                           | `https://cardia-api.emipanelli.com` |
+| `CARDIA_API_TOKEN` | Token admin; se envía como header `x-admin-token`  | `tok_xxx`                           |
 
 ```bash
 export CARDIA_API_URL="https://cardia-api.emipanelli.com"
 export CARDIA_API_TOKEN="tu-admin-token"
 ```
 
-Si falta alguna, el CLI te avisa con un mensaje claro y sale con código `3`.
+Todas las requests tienen un timeout de 15 segundos.
 
 ## Comandos
 
-### 1. `cardia cards`
+### `cardia teams` — onboarding
 
-Lista las tarjetas disponibles (id, label, `••••last4`, estado, gastado/límite).
+Wizard interactivo: creá tu empresa y dale una tarjeta a un miembro del equipo
+(persona o agente). Las tarjetas de **agentes** se emiten en modo `scoped`
+(deny-by-default: arrancan sin permisos y les habilitás compras con
+`cardia grant`); las de **personas** en modo `free` (pagan hasta el límite).
+
+```bash
+cardia teams
+```
+
+### `cardia cards`
+
+Lista las tarjetas (id, label, `••••last4`, estado, gastado/límite).
 
 ```bash
 cardia cards
@@ -60,7 +74,7 @@ Tarjetas (2)
   card_999  Marketing     ••••0007  BLOCKED gastado $0 / límite $50.000
 ```
 
-### 2. `cardia grant` — crear un permiso
+### `cardia grant` — crear un permiso
 
 Habilita al agente a comprar en un comercio, con un tope y una vigencia.
 Los pesos se convierten a centavos (×100). El TTL acepta `30m`, `1h`, `24h`,
@@ -79,82 +93,111 @@ cardia grant --card card_123 --merchant Jumbo --max 50000 --ttl 1h
     vigencia : vence 23/6/2026, 15:30:00 (en 1h)
 ```
 
-### 3. `cardia buy` — flujo del agente
+### `cardia buy` — flujo del agente
 
 Dispara la compra (simulate). Dos modos:
 
 - **Con `--max`**: primero crea el permiso (grant) y después intenta la compra.
-  Útil para que el agente declare límite y compre en un solo paso.
 - **Sin `--max`**: solo intenta la compra contra los permisos ya existentes.
 
 `idempotencyKey` se genera automáticamente con `crypto.randomUUID()`.
 
 ```bash
-# grant + buy en un paso
 cardia buy --card card_123 --merchant Jumbo --amount 12000 --max 50000 --ttl 1h
-
-# solo buy (usa permisos ya creados)
 cardia buy --card card_123 --merchant Jumbo --amount 12000
 ```
 
-Aprobada:
+Aprobada: `✓ APPROVED $12.000 en Jumbo  (permiso perm_abc)`
+Rechazada (sale con código `1`): `✗ REJECTED $80.000 en Jumbo` + motivo.
 
-```
-✓ APPROVED $12.000 en Jumbo  (permiso perm_abc)
-```
-
-Rechazada (sale con código `1`):
-
-```
-✗ REJECTED $80.000 en Jumbo
-  motivo: amount exceeds permission max
-```
-
-### 4. `cardia permissions` — listar permisos
-
-Lista los permisos con estado y vigencia. Filtrable por tarjeta.
+### `cardia permissions` — listar permisos
 
 ```bash
 cardia permissions
 cardia permissions --card card_123
 ```
 
+### `cardia mcp` — servidor MCP (Claude Code, Claude Desktop, Cursor)
+
+Levanta un servidor [MCP](https://modelcontextprotocol.io) por **stdio** para
+que tu agente opere Cardia con tools nativas, sin shellear al CLI.
+
+**Claude Code:**
+
+```bash
+claude mcp add cardia --env CARDIA_API_URL=https://cardia-api.emipanelli.com --env CARDIA_API_TOKEN=tok_xxx -- npx cardia mcp
 ```
-Permisos (1)
-  perm_abc
-    comercio : Jumbo
-    tope     : $50.000
-    tarjeta  : card_123
-    estado   : ACTIVE
-    vigencia : vence 23/6/2026, 15:30:00 (en 58m)
+
+(Si ya exportaste las env vars en tu shell, alcanza con
+`claude mcp add cardia -- npx cardia mcp`.)
+
+**Claude Desktop** (`claude_desktop_config.json`) **/ Cursor** (`.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "cardia": {
+      "command": "npx",
+      "args": ["cardia", "mcp"],
+      "env": {
+        "CARDIA_API_URL": "https://cardia-api.emipanelli.com",
+        "CARDIA_API_TOKEN": "tok_xxx"
+      }
+    }
+  }
+}
 ```
+
+Tools expuestas (todos los montos en **centavos**):
+
+| Tool                | Qué hace                                                                  |
+| ------------------- | ------------------------------------------------------------------------- |
+| `list_cards`        | Lista tarjetas (límite/gastado, estado, modo)                             |
+| `create_card`       | Crea cuenta + tarjetas para un miembro (modo `scoped` por defecto)        |
+| `check_balance`     | Saldos por cuenta (ARS/USD); con `accountId` da el detalle de una cuenta  |
+| `set_limit`         | Cambia el límite de una tarjeta                                           |
+| `freeze_card`       | Congela una tarjeta (rechaza toda compra)                                 |
+| `unfreeze_card`     | Reactiva una tarjeta congelada                                            |
+| `grant_permission`  | Otorga un permiso acotado (comercio + tope + TTL)                         |
+| `list_permissions`  | Lista permisos, filtrable por tarjeta                                     |
+| `authorize_payment` | Intenta un pago → `APPROVED` / `REJECTED` con motivo                      |
+| `get_transactions`  | Transacciones paginadas, filtrables por tarjeta y resultado               |
+
+Sin `CARDIA_API_URL`/`CARDIA_API_TOKEN`, `cardia mcp` escribe el error a
+stderr y sale con `1`; stdout queda limpio para el handshake JSON-RPC.
 
 ## Códigos de salida
 
-| Código | Significado                                  |
-| ------ | -------------------------------------------- |
-| `0`    | OK                                           |
-| `1`    | Compra rechazada (REJECTED) o error genérico |
-| `2`    | Argumentos inválidos / uso incorrecto        |
-| `3`    | Falta configuración (env vars)               |
-| `4`    | Error de la API o de red                     |
+| Código | Significado                                                          |
+| ------ | -------------------------------------------------------------------- |
+| `0`    | OK (incluye el mensaje de beta sin credenciales)                     |
+| `1`    | Compra rechazada (REJECTED), `mcp` sin credenciales o error genérico |
+| `2`    | Argumentos inválidos / comando desconocido                           |
+| `3`    | Falta configuración (env vars) en comandos que la requieren          |
+| `4`    | Error de la API o de red                                             |
 
 ## Endpoints usados
 
-| Comando       | Método + endpoint                          |
-| ------------- | ------------------------------------------ |
-| `cards`       | `GET /admin/cards`                         |
-| `grant`       | `POST /admin/permissions`                  |
-| `buy`         | `POST /admin/permissions` (si `--max`) + `POST /admin/authorizations/simulate` |
-| `permissions` | `GET /admin/permissions`                   |
+| Comando / tool        | Método + endpoint                                                              |
+| --------------------- | ------------------------------------------------------------------------------ |
+| `cards`, `list_cards` | `GET /admin/cards`                                                             |
+| `teams`, `create_card`| `POST /admin/customers` + `POST /admin/cards`                                  |
+| `grant`, `grant_permission` | `POST /admin/permissions`                                                |
+| `buy`, `authorize_payment`  | `POST /admin/authorizations/simulate`                                    |
+| `permissions`, `list_permissions` | `GET /admin/permissions`                                           |
+| `check_balance`       | `GET /admin/accounts` · `GET /admin/accounts/:id`                              |
+| `set_limit`           | `PATCH /admin/cards/:id/limit`                                                 |
+| `freeze_card` / `unfreeze_card` | `POST /admin/cards/:id/block` · `POST /admin/cards/:id/activate`     |
+| `get_transactions`    | `GET /admin/authorizations`                                                    |
 
 Todas las requests envían el header `x-admin-token`.
 
 ## Desarrollo
 
 ```bash
+npm install
 npm run dev     # tsc --watch
-npm run build   # compila una vez
+npm run build   # compila una vez a dist/
 ```
 
 Los colores ANSI se desactivan automáticamente si la salida no es una TTY o si

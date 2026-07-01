@@ -1,6 +1,6 @@
 {
   "name": "cardia",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "CLI para que un agente IA opere tarjetas Cardia con control via permisos acotados",
   "type": "module",
   "bin": {
@@ -22,5 +22,9 @@
   "devDependencies": {
     "@types/node": "^20.11.0",
     "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
   }
 }
