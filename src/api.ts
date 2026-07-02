@@ -17,6 +17,27 @@ export interface Card {
   status: string;
   accountId: string;
   currency?: Currency;
+  mode?: string;
+  /** Tarjeta por compra: muere sola tras su primer pago APPROVED. */
+  singleUse?: boolean;
+  /** Comercio al que está atada la tarjeta single-use. */
+  merchant?: string;
+  createdAt?: string;
+}
+
+/**
+ * Datos sensibles de una tarjeta (PAN/CVV/vencimiento). Se muestran UNA sola
+ * vez al crearla; después solo via GET /admin/cards/:id/reveal.
+ */
+export interface CardReveal {
+  environment: string; // "sandbox"
+  holder?: string;
+  panAvailable: boolean;
+  pan?: string;
+  cvv?: string;
+  exp?: string;
+  last4?: string;
+  warning?: string;
 }
 
 /** Cliente/empresa titular (capa de organización sobre las cuentas). */
@@ -371,6 +392,41 @@ export class CardiaApi {
       `/admin/cards/${encodeURIComponent(cardId)}/activate`
     );
     return data.card ?? (data as unknown as Card);
+  }
+
+  /**
+   * POST /admin/cards/purchase — crea una TARJETA POR COMPRA (single-use):
+   * atada a un comercio y un monto, muere sola tras su primer pago APPROVED.
+   * Devuelve la tarjeta + el reveal (PAN/CVV/exp), que se muestra UNA sola vez.
+   */
+  async createPurchaseCard(input: {
+    merchant: string;
+    amountCents: number;
+    label?: string;
+    customerId?: string;
+    accountId?: string;
+    currency?: Currency;
+  }): Promise<{ card: Card; reveal: CardReveal }> {
+    const data = await this.request<{ card: Card; reveal: CardReveal }>(
+      "POST",
+      "/admin/cards/purchase",
+      input
+    );
+    // Fallback defensivo: si la API devuelve el objeto "plano", lo usamos igual.
+    return {
+      card: data.card ?? (data as unknown as Card),
+      reveal: data.reveal ?? ({ panAvailable: false, environment: "sandbox" } as CardReveal),
+    };
+  }
+
+  /** GET /admin/cards/:id/reveal — datos sensibles de la tarjeta (PAN/CVV/exp). */
+  async revealCard(cardId: string): Promise<CardReveal> {
+    const data = await this.request<{ reveal?: CardReveal } & CardReveal>(
+      "GET",
+      `/admin/cards/${encodeURIComponent(cardId)}/reveal`
+    );
+    // Fallback defensivo: acepta { reveal: {...} } o el reveal "plano".
+    return data.reveal ?? (data as CardReveal);
   }
 
   /** GET /admin/authorizations — transacciones paginadas, filtro opcional por tarjeta/estado. */

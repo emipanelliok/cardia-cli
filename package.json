@@ -1,6 +1,6 @@
 {
   "name": "cardia",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "CLI para que un agente IA opere tarjetas Cardia con control via permisos acotados",
   "type": "module",
   "bin": {

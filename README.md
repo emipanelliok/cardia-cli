@@ -117,6 +117,50 @@ cardia permissions
 cardia permissions --card card_123
 ```
 
+### `cardia purchase` / `cardia reveal` — tarjeta por compra (single-use)
+
+Crea una **tarjeta por compra**: nace atada a **un comercio** y **un monto**
+(que es su límite exacto), devuelve los datos (PAN/CVV/vencimiento) **una sola
+vez**, y **muere sola** (se cancela) después de su primer pago `APPROVED`.
+Sirve para exactamente una compra — nada de tarjetas "vivas" dando vueltas.
+
+Ejemplo — el agente te compra un vuelo:
+
+```bash
+cardia purchase --merchant Aerolineas --amount 150000 --label "Vuelo MDZ-AEP"
+```
+
+```
+✓ Tarjeta por compra creada (single-use)
+  card_abc  Vuelo MDZ-AEP  ••••3119
+    lock   : 🔒 Aerolineas (solo aprueba en este comercio)
+    límite : $150.000 [ARS]
+
+  ⚠ Datos de la tarjeta — se muestran una sola vez. Guardalos ahora.
+    número : 4111 1111 1111 3119
+    cvv    : 123
+    vence  : 06/29
+
+  Flujo: si la cuenta es nueva, fondeala (cash-in) antes de pagar.
+  La compra aprueba UNA vez y la tarjeta muere sola (se cancela).
+  Ojo: el saldo de cuentas recién creadas puede tardar ~10s en verse.
+```
+
+Flujo completo: **crear → cargar los datos en el checkout → pagar → la tarjeta
+muere**. Si la cuenta que respalda la tarjeta es nueva, hacé el cash-in antes
+de pagar; el saldo Pomelo de cuentas recién creadas puede tardar **~10
+segundos** en verse reflejado.
+
+`cardia reveal` vuelve a mostrar los datos de una tarjeta existente:
+
+```bash
+cardia reveal --card card_abc
+```
+
+- Tarjeta **cancelada** (p. ej. una single-use que ya pagó) → la API responde
+  `409` y el CLI lo explica ("ya hizo su pago y murió").
+- Token con **rol agent** → `403`: el reveal es solo para el dueño (owner).
+
 ### `cardia mcp` — servidor MCP (Claude Code, Claude Desktop, Cursor)
 
 Levanta un servidor [MCP](https://modelcontextprotocol.io) por **stdio** para
@@ -162,6 +206,8 @@ Tools expuestas (todos los montos en **centavos**):
 | `list_permissions`  | Lista permisos, filtrable por tarjeta                                     |
 | `authorize_payment` | Intenta un pago → `APPROVED` / `REJECTED` con motivo                      |
 | `get_transactions`  | Transacciones paginadas, filtrables por tarjeta y resultado               |
+| `create_purchase_card` | Tarjeta por compra (single-use): un comercio + un monto **en pesos**, PAN/CVV una sola vez, muere tras el primer pago |
+| `reveal_card`       | Vuelve a mostrar PAN/CVV/vencimiento de una tarjeta (409 si está cancelada) |
 
 Sin `CARDIA_API_URL`/`CARDIA_API_TOKEN`, `cardia mcp` escribe el error a
 stderr y sale con `1`; stdout queda limpio para el handshake JSON-RPC.
@@ -189,6 +235,8 @@ stderr y sale con `1`; stdout queda limpio para el handshake JSON-RPC.
 | `set_limit`           | `PATCH /admin/cards/:id/limit`                                                 |
 | `freeze_card` / `unfreeze_card` | `POST /admin/cards/:id/block` · `POST /admin/cards/:id/activate`     |
 | `get_transactions`    | `GET /admin/authorizations`                                                    |
+| `purchase`, `create_purchase_card` | `POST /admin/cards/purchase`                                      |
+| `reveal`, `reveal_card` | `GET /admin/cards/:id/reveal`                                                |
 
 Todas las requests envían el header `x-admin-token`.
 

@@ -21,6 +21,7 @@ import {
   ConfigError,
   ApiError,
   type Card,
+  type CardReveal,
   type Permission,
 } from "./api.js";
 
@@ -257,6 +258,86 @@ async function cmdPermissions(
 }
 
 // ---------------------------------------------------------------------------
+// cardia purchase / cardia reveal — tarjeta por compra (single-use)
+// ---------------------------------------------------------------------------
+
+/** Imprime los datos sensibles del reveal con la advertencia de un solo uso. */
+function printReveal(reveal: CardReveal): void {
+  console.log("");
+  console.log(
+    `  ${c.yellow("⚠")} ${c.bold("Datos de la tarjeta — se muestran una sola vez. Guardalos ahora.")}`
+  );
+  if (reveal.panAvailable && reveal.pan) {
+    console.log(`    número : ${c.bold(reveal.pan)}`);
+    if (reveal.cvv) console.log(`    cvv    : ${c.bold(reveal.cvv)}`);
+    if (reveal.exp) console.log(`    vence  : ${c.bold(reveal.exp)}`);
+  } else {
+    console.log(
+      c.gray(
+        `    PAN no disponible todavía (••••${reveal.last4 ?? "----"}). ` +
+          `Reintentá en unos segundos con: cardia reveal --card <id>`
+      )
+    );
+  }
+  if (reveal.holder) console.log(`    titular: ${reveal.holder}`);
+  console.log(c.gray(`    entorno: ${reveal.environment}`));
+  if (reveal.warning) console.log(c.gray(`    ${reveal.warning}`));
+}
+
+async function cmdPurchase(
+  api: CardiaApi,
+  opts: { merchant?: string; amount?: string; label?: string }
+): Promise<void> {
+  if (!opts.merchant) throw new UsageError("Falta --merchant <nombre>.");
+  const amountCents = pesosToCents(opts.amount, "--amount");
+
+  const { card, reveal } = await api.createPurchaseCard({
+    merchant: opts.merchant,
+    amountCents,
+    label: opts.label,
+  });
+
+  console.log(`${OK} ${c.bold("Tarjeta por compra creada")} ${c.gray("(single-use)")}`);
+  console.log(`  ${c.cyan(card.id)}  ${c.bold(card.label)}  ${c.gray("••••" + card.last4)}`);
+  console.log(`    lock   : 🔒 ${c.bold(card.merchant ?? opts.merchant)} ${c.gray("(solo aprueba en este comercio)")}`);
+  console.log(`    límite : ${centsToPesos(card.limit)} [${card.currency ?? "ARS"}]`);
+
+  printReveal(reveal);
+
+  console.log("");
+  console.log(c.gray("  Flujo: si la cuenta es nueva, fondeala (cash-in) antes de pagar."));
+  console.log(c.gray("  La compra aprueba UNA vez y la tarjeta muere sola (se cancela)."));
+  console.log(c.gray("  Ojo: el saldo de cuentas recién creadas puede tardar ~10s en verse."));
+}
+
+async function cmdReveal(api: CardiaApi, opts: { card?: string }): Promise<void> {
+  if (!opts.card) throw new UsageError("Falta --card <id>.");
+  let reveal: CardReveal;
+  try {
+    reveal = await api.revealCard(opts.card);
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 409) {
+      throw new ApiError(
+        `La tarjeta ${opts.card} está cancelada: si era una tarjeta por compra, ya hizo su pago y murió. ` +
+          `Creá otra con: cardia purchase --merchant <m> --amount <pesos>`,
+        err.status,
+        err.body
+      );
+    }
+    if (err instanceof ApiError && err.status === 403) {
+      throw new ApiError(
+        "Tu token no puede revelar datos de tarjetas (rol agent). Pedile el reveal al dueño (token owner).",
+        err.status,
+        err.body
+      );
+    }
+    throw err;
+  }
+  console.log(`${OK} ${c.bold("Reveal de la tarjeta")} ${c.cyan(opts.card)}`);
+  printReveal(reveal);
+}
+
+// ---------------------------------------------------------------------------
 // cardia teams — onboarding interactivo: empresa + tarjeta para un miembro (persona/agente)
 // ---------------------------------------------------------------------------
 async function cmdTeams(api: CardiaApi): Promise<void> {
@@ -352,6 +433,10 @@ function printHelp(): void {
     `  ${c.cyan("buy")}     --card <id> --merchant <Jumbo> --amount <pesos> [--max <pesos>] [--ttl 1h]`,
     `                                   Compra. Con --max crea el permiso y luego compra.`,
     `  ${c.cyan("permissions")} [--card <id>]         Lista permisos con estado y vigencia.`,
+    `  ${c.cyan("purchase")} --merchant <m> --amount <pesos> [--label <l>]`,
+    `                                   Tarjeta por compra (single-use): nace atada a un comercio y monto,`,
+    `                                   devuelve PAN/CVV una sola vez y muere tras su primer pago aprobado.`,
+    `  ${c.cyan("reveal")}  --card <id>              Vuelve a mostrar los datos (PAN/CVV/exp) de una tarjeta.`,
     `  ${c.cyan("mcp")}                              Servidor MCP por stdio (Claude Code, Claude Desktop, Cursor).`,
     "",
     c.bold("Variables de entorno:"),
@@ -364,6 +449,8 @@ function printHelp(): void {
     "  cardia buy --card card_123 --merchant Jumbo --amount 12000 --max 50000",
     "  cardia buy --card card_123 --merchant Jumbo --amount 12000",
     "  cardia permissions --card card_123",
+    "  cardia purchase --merchant Aerolineas --amount 150000 --label 'Vuelo MDZ-AEP'",
+    "  cardia reveal --card card_123",
     "  claude mcp add cardia -- npx cardia mcp   " + c.gray("# conectá tu agente por MCP"),
   ];
   console.log(lines.join("\n"));
@@ -386,7 +473,16 @@ function printBeta(): void {
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
-const KNOWN_COMMANDS = ["teams", "cards", "grant", "buy", "permissions", "mcp"];
+const KNOWN_COMMANDS = [
+  "teams",
+  "cards",
+  "grant",
+  "buy",
+  "permissions",
+  "purchase",
+  "reveal",
+  "mcp",
+];
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
@@ -412,7 +508,7 @@ async function main(): Promise<void> {
 
   // Parseo de flags compartido por los comandos que las usan.
   let values: Record<string, string | undefined> = {};
-  if (["grant", "buy", "permissions"].includes(command)) {
+  if (["grant", "buy", "permissions", "purchase", "reveal"].includes(command)) {
     try {
       const parsed = parseArgs({
         args: argv.slice(1),
@@ -422,6 +518,7 @@ async function main(): Promise<void> {
           max: { type: "string" },
           amount: { type: "string" },
           ttl: { type: "string" },
+          label: { type: "string" },
         },
         allowPositionals: false,
         strict: true,
@@ -478,6 +575,12 @@ async function main(): Promise<void> {
       break;
     case "permissions":
       await cmdPermissions(api, values);
+      break;
+    case "purchase":
+      await cmdPurchase(api, values);
+      break;
+    case "reveal":
+      await cmdReveal(api, values);
       break;
   }
 }

@@ -17,7 +17,7 @@ import { createRequire } from "node:module";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { CardiaApi } from "./api.js";
+import { ApiError, CardiaApi, type CardReveal } from "./api.js";
 
 const require = createRequire(import.meta.url);
 const pkg = require("../package.json") as { name: string; version: string };
@@ -64,8 +64,26 @@ function money(cents: number, currency?: string): string {
   return currency === "USD" ? `US$${units}` : `$${units}`;
 }
 
+/** Resumen legible del reveal (PAN/CVV/exp) para las tools single-use. */
+function revealSummary(reveal: CardReveal): string {
+  if (reveal.panAvailable && reveal.pan) {
+    return (
+      `DATOS DE LA TARJETA (mostralos al usuario AHORA, se entregan una sola vez):\n` +
+      `- número: ${reveal.pan}\n` +
+      (reveal.cvv ? `- cvv: ${reveal.cvv}\n` : "") +
+      (reveal.exp ? `- vence: ${reveal.exp}\n` : "") +
+      (reveal.holder ? `- titular: ${reveal.holder}\n` : "") +
+      `- entorno: ${reveal.environment}`
+    );
+  }
+  return (
+    `PAN todavía no disponible (••••${reveal.last4 ?? "----"}, entorno ${reveal.environment}). ` +
+    `Reintentá en unos segundos con reveal_card.`
+  );
+}
+
 // ---------------------------------------------------------------------------
-// Servidor MCP con las 10 tools de Cardia
+// Servidor MCP con las 12 tools de Cardia
 // ---------------------------------------------------------------------------
 
 export function buildServer(api: CardiaApi): McpServer {
@@ -431,6 +449,83 @@ export function buildServer(api: CardiaApi): McpServer {
         `${authorizations.length} transacción(es)${pageInfo}:\n${lines.join("\n")}`,
         { authorizations, pagination }
       );
+    })
+  );
+
+  // 11. create_purchase_card
+  server.registerTool(
+    "create_purchase_card",
+    {
+      title: "Crear tarjeta por compra (single-use)",
+      description:
+        "Crea una TARJETA POR COMPRA (single-use): nace atada a UN comercio y un monto en PESOS, " +
+        "y muere sola (se cancela) después de su primer pago APPROVED — sirve para exactamente una compra. " +
+        "Devuelve la tarjeta + los datos sensibles (PAN/CVV/vencimiento) UNA SOLA VEZ: mostralos al usuario " +
+        "de inmediato. Si la cuenta es nueva hace falta fondearla (cash-in) antes de pagar, y el saldo " +
+        "puede tardar ~10 segundos en verse reflejado.",
+      inputSchema: {
+        merchant: z
+          .string()
+          .min(1)
+          .describe("Comercio ÚNICO donde la tarjeta puede pagar (ej. 'Aerolineas Argentinas')"),
+        amount_pesos: z
+          .number()
+          .positive()
+          .describe("Monto de la compra EN PESOS (se convierte a centavos; es el límite exacto de la tarjeta)"),
+        label: z
+          .string()
+          .optional()
+          .describe("Nombre descriptivo de la tarjeta (ej. 'Vuelo MDZ-AEP') (opcional)"),
+      },
+    },
+    safe(async (args: { merchant: string; amount_pesos: number; label?: string }) => {
+      const { card, reveal } = await api.createPurchaseCard({
+        merchant: args.merchant,
+        amountCents: Math.round(args.amount_pesos * 100),
+        label: args.label,
+      });
+      return ok(
+        `Tarjeta por compra ${card.id} "${card.label}" creada (single-use, 🔒 ${card.merchant ?? args.merchant}): ` +
+          `••••${card.last4}, límite ${money(card.limit, card.currency)}. ` +
+          `Aprueba UNA compra en ese comercio y se cancela sola.\n\n` +
+          revealSummary(reveal) +
+          `\n\nNota: si la cuenta es nueva, fondeala antes (el saldo puede tardar ~10s en verse).`,
+        { card, reveal }
+      );
+    })
+  );
+
+  // 12. reveal_card
+  server.registerTool(
+    "reveal_card",
+    {
+      title: "Revelar datos de tarjeta",
+      description:
+        "Vuelve a mostrar los datos sensibles (PAN/CVV/vencimiento) de una tarjeta existente. " +
+        "Requiere token de dueño (owner); con rol agent la API responde 403. " +
+        "Si la tarjeta está cancelada (p. ej. una single-use que ya hizo su pago) responde 409.",
+      inputSchema: {
+        cardId: z.string().min(1).describe("ID de la tarjeta (card_...)"),
+      },
+    },
+    safe(async (args: { cardId: string }) => {
+      try {
+        const reveal = await api.revealCard(args.cardId);
+        return ok(`Reveal de la tarjeta ${args.cardId}:\n\n${revealSummary(reveal)}`, { reveal });
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 409) {
+          return fail(
+            `La tarjeta ${args.cardId} está cancelada: si era una tarjeta por compra, ya hizo su pago y murió. ` +
+              `Creá otra con create_purchase_card.`
+          );
+        }
+        if (err instanceof ApiError && err.status === 403) {
+          return fail(
+            "Este token no puede revelar datos de tarjetas (rol agent). El reveal requiere el token del dueño (owner)."
+          );
+        }
+        throw err;
+      }
     })
   );
 
